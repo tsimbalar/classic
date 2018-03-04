@@ -29,6 +29,7 @@ namespace SerilogWeb.Classic
     public class ApplicationLifecycleModule : IHttpModule
     {
         const string StopWatchKey = "SerilogWeb.Classic.ApplicationLifecycleModule.StopWatch";
+        private const string ExceptionSourcePropertyKey = "ExceptionSource";
 
         static LogPostedFormDataOption _logPostedFormData = LogPostedFormDataOption.Never;
         static bool _isEnabled = true;
@@ -160,7 +161,7 @@ namespace SerilogWeb.Classic
         /// <exception cref="System.ArgumentNullException"></exception>
         public static Func<HttpContext, bool> ShouldLogPostedFormData
         {
-            get { return _shouldLogPostedFormData;}
+            get { return _shouldLogPostedFormData; }
             set
             {
                 if (value == null)
@@ -178,36 +179,46 @@ namespace SerilogWeb.Classic
         {
             application.BeginRequest += (sender, args) =>
             {
-                if(_isEnabled && application.Context != null)
+                if (_isEnabled && application.Context != null)
                 {
                     application.Context.Items[StopWatchKey] = Stopwatch.StartNew();
-                }                
+                }
             };
 
             application.LogRequest += (sender, args) =>
             {
                 if (_isEnabled && application.Context != null)
                 {
-                    var stopwatch = application.Context.Items[StopWatchKey] as Stopwatch;
+                    var applicationContext = application.Context;
+                    var stopwatch = applicationContext.Items[StopWatchKey] as Stopwatch;
                     if (stopwatch == null)
                         return;
 
                     stopwatch.Stop();
 
                     var request = HttpContextCurrent.Request;
-                    if (request == null || _requestFilter(application.Context))
+                    if (request == null || _requestFilter(applicationContext))
                         return;
 
-                    var error = application.Server.GetLastError();
-                    var level = error != null || application.Response.StatusCode >= 500 ? LogEventLevel.Error : _requestLoggingLevel;
-
-                    if (level == LogEventLevel.Error && error == null && application.Context.AllErrors != null)
-                    {
-                        error = application.Context.AllErrors.LastOrDefault();
-                    }
+                    var response = applicationContext.Response;
 
                     var logger = Logger;
-                    if (logger.IsEnabled(_formDataLoggingLevel) && FormLoggingStrategy(application.Context))
+
+                    var level = _requestLoggingLevel;
+                    var lastError = GetAllErrors(applicationContext).FirstOrDefault();
+                    if (lastError.HasValue)
+                    {
+                        // if an error happened, increase the level appropriately
+                        level = lastError.Level ?? LogEventLevel.Error;
+                    }
+
+                    if (response.StatusCode >= 500)
+                    {
+                        // Internal Server Error and friends are logged as Error no matter what
+                        level = LogEventLevel.Error;
+                    }
+
+                    if (logger.IsEnabled(_formDataLoggingLevel) && FormLoggingStrategy(applicationContext))
                     {
                         var form = request.Unvalidated.Form;
                         if (form.HasKeys())
@@ -217,16 +228,55 @@ namespace SerilogWeb.Classic
                         }
                     }
 
-                    logger.Write(
+                    if (lastError.Source != null)
+                    {
+                        logger = logger.ForContext(ExceptionSourcePropertyKey, lastError.Source);
+                    }
+
+                    logger
+                        .Write(
                         level,
-                        error,
-                        "HTTP {Method} {RawUrl} responded {StatusCode} in {ElapsedMilliseconds}ms", 
-                        request.HttpMethod, 
-                        request.RawUrl, 
-                        application.Response.StatusCode, 
+                        lastError.Exception,
+                        "HTTP {Method} {RawUrl} responded {StatusCode} in {ElapsedMilliseconds}ms",
+                        request.HttpMethod,
+                        request.RawUrl,
+                        response.StatusCode,
                         stopwatch.ElapsedMilliseconds);
-                }                
+                }
             };
+        }
+
+        /// <summary>
+        /// Gets an IEnumerable of the exceptions possibly intercepted during the request.
+        /// 
+        /// If there is a Server.GetLastError(), return it no matter what ...
+        /// Then fall back to HttpContext.AllErrors, starting from the last / most recent one
+        /// Then fall back to SerilogWebErrors
+        /// </summary>
+        private IEnumerable<SerilogWebErrorInfo> GetAllErrors(HttpContext applicationContext)
+        {
+            if (applicationContext == null) throw new ArgumentNullException(nameof(applicationContext));
+            var lastError = applicationContext.Server.GetLastError();
+            if (lastError != null)
+            {
+                yield return new SerilogWebErrorInfo(lastError, "Server.GetLastError()", LogEventLevel.Error);
+            }
+
+            var allApplicationErrors = applicationContext.AllErrors;
+            if (allApplicationErrors != null)
+            {
+                var applicationErrorsStartingWithLast = allApplicationErrors.Reverse();
+                foreach (var error in applicationErrorsStartingWithLast)
+                {
+                    yield return new SerilogWebErrorInfo(error, "Context.AllErrors", LogEventLevel.Error);
+                }
+            }
+
+            var serilogErrorsStartingWithLast = applicationContext.GetSerilogWebErrors().Reverse();
+            foreach (var serilogWebErrorInfo in serilogErrorsStartingWithLast)
+            {
+                yield return serilogWebErrorInfo;
+            }
         }
 
         static Func<HttpContext, bool> FormLoggingStrategy

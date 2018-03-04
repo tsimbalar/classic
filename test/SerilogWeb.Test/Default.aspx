@@ -11,6 +11,7 @@
     <div>
         <asp:TextBox runat="server" Text="My Content"></asp:TextBox>
         <button runat="server" OnServerClick="Fail">Click me</button>
+        <button runat="server" OnServerClick="ReportSerilogError">Click me for a SerilogWeb Error</button>
     
     </div>
     </form>
